@@ -175,6 +175,7 @@ CREATE TABLE services (
     service_id           VARCHAR2(10) NOT NULL,
     service_category_id  VARCHAR2(10) NOT NULL,
     service_name         NVARCHAR2(120) NOT NULL,
+    species             NVARCHAR2(20) NOT NULL,
     description_sv       CLOB,
     base_price           NUMBER(12,2) DEFAULT 0 NOT NULL,
     duration_minutes     NUMBER(4),-- thời lượng thực hiện dịch vụ 
@@ -401,7 +402,6 @@ CREATE TABLE service_product_standard (
     standard_id         VARCHAR2(10) NOT NULL,
     service_id          VARCHAR2(10) NOT NULL,
     product_id          VARCHAR2(10) NOT NULL,
-    species             NVARCHAR2(20) NOT NULL,
     min_weight_kg       NUMBER(5,2) NOT NULL,
     max_weight_kg       NUMBER(5,2) NOT NULL,
     usage_amount        NUMBER(10,2) NOT NULL,
