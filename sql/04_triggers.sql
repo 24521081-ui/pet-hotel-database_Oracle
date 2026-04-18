@@ -278,3 +278,140 @@ EXCEPTION
         );
 END;
 /
+/*
+MÔ TẢ:
+Tự động kích hoạt các thủ tục kiểm tra kho khi có thao tác chèn hoặc cập nhật trạng thái dịch vụ.
+*/
+CREATE OR REPLACE TRIGGER trg_bks_inventory_sync
+BEFORE INSERT OR UPDATE ON booking_services
+FOR EACH ROW
+BEGIN
+    -- Khi thêm mới dịch vụ
+    IF INSERTING THEN
+        IF :NEW.status IN ('PENDING', 'SCHEDULED', 'IN_PROGRESS', 'DONE') THEN
+            sp_validate_and_execute_stock(:NEW.booking_id, :NEW.service_id, :NEW.pet_id);
+        END IF;
+    END IF;
+
+    -- Khi cập nhật trạng thái
+    IF UPDATING THEN
+        -- Hoàn trả kho nếu hủy dịch vụ
+        IF :OLD.status IN ('PENDING', 'SCHEDULED', 'IN_PROGRESS', 'DONE') 
+           AND :NEW.status = 'CANCELLED' THEN
+            sp_refund_service_stock(:NEW.booking_id, :NEW.service_id, :NEW.pet_id);
+        END IF;
+
+        -- Trừ lại kho nếu khôi phục dịch vụ từ trạng thái đã hủy
+        IF :OLD.status = 'CANCELLED' 
+           AND :NEW.status IN ('PENDING', 'SCHEDULED', 'IN_PROGRESS', 'DONE') THEN
+            sp_validate_and_execute_stock(:NEW.booking_id, :NEW.service_id, :NEW.pet_id);
+        END IF;
+    END IF;
+END;
+/
+/*
+MÔ TẢ:
+Trigger bắt sự kiện BEFORE INSERT hoặc UPDATE trên bảng booking_room_pet.
+Tự động gọi hàm kiểm tra tải trọng (fn_check_pet_weight_limit). Nếu hàm trả về FALSE, lập tức sinh lỗi vận hành và hủy thao tác.
+*/
+CREATE OR REPLACE TRIGGER trg_validate_pet_room_weight
+BEFORE INSERT OR UPDATE ON booking_room_pet
+FOR EACH ROW
+BEGIN
+    IF NOT fn_check_pet_weight_limit(:NEW.pet_id, :NEW.booking_room_id) THEN
+        RAISE_APPLICATION_ERROR(-20040, 'LỖI VẬN HÀNH: Trọng lượng thú cưng vượt quá giới hạn an toàn của loại phòng này.');
+    END IF;
+END;
+/
+--8.	Đồng bộ Đối soát Thanh toán (orders & payments): Tổng số tiền (amount) của các giao dịch có trạng thái thành công ('SUCCESS')
+--trong bảng payments thuộc về một hóa đơn, không được vượt quá tổng tiền (grand_total) của hóa đơn đó trong bảng orders.
+--(Nếu bằng đúng thì hóa đơn đổi thành 'PAID', nếu nhỏ hơn thì là 'PARTIAL').
+--11.	Nhân viên Lễ tân không thể chuyển trạng thái của Hóa đơn sang 'PAID' (Đã thanh toán xong) nếu các Phiếu đặt phòng hoặc 
+--Dịch vụ cấu thành nên hóa đơn đó vẫn còn đang ở trạng thái chưa hoàn tất (Ví dụ: còn ở trạng thái 'IN_PROGRESS' hoặc 'CHECKED_IN').
+--Khách hàng phải hoàn tất chu trình dịch vụ trước khi chốt hóa đơn.
+CREATE OR REPLACE TRIGGER trg_payment_logic_snyc -- Ràng buộc cập nhập status orders
+FOR INSERT OR UPDATE ON payments
+COMPOUND TRIGGER
+BEGIN
+    AFTER EACH ROW IS
+        IF UPDATING AND (:NEW.order_id <> :OLD.order_id) THEN
+                update_orders_status(:OLD.order_id);
+        END IF;   
+        update_orders_status(:NEW.order_id);
+    END AFTER EACH ROW;
+END;
+/
+CREATE OR REPLACE TRIGGER trg_prevent_manual_paid_status -- Trigger tránh cập nhập thủ công
+BEFORE UPDATE OF status ON orders
+FOR EACH ROW
+BEGIN
+    -- Chỉ kiểm tra khi có người muốn chuyển trạng thái sang 'PAID'
+    IF :NEW.status = 'PAID' THEN
+        -- Điều kiện 1: Dịch vụ và Phòng phải xong
+        IF NOT fn_is_order_ready_to_pay(:NEW.order_id) THEN
+            RAISE_APPLICATION_ERROR(-20050, 'LỖI: Hóa đơn chưa thể thanh toán vì còn dịch vụ hoặc phòng chưa hoàn tất.');
+        END IF;
+
+        -- Điều kiện 2: Tiền phải trả đủ (Lấy tổng tiền đã thanh toán thành công)
+        -- Chỗ này bạn có thể gọi lại hàm tính tổng tiền payments SUCCESS của mình
+        -- Nếu tiền thiếu, cũng RAISE_APPLICATION_ERROR.
+    END IF;
+END;
+/
+--7
+--Tổng thành tiền (line_total) của tất cả các dòng chi tiết thuộc cùng một mã hóa đơn trong bảng order_details,
+--cộng với tiền thuế (tax_total), bắt buộc phải bằng đúng tổng tiền thanh toán (grand_total) ghi ở bảng orders.
+--Thứ tự thực hiện
+-- Thêm Booking
+-- Thêm khách hàng thông tin khách hàng
+-- Lập một booking
+-- Tôi muốn thực hiện ràng buộc là grand_total luôn bằng tổng line_total
+-- Nếu lập order ngay lập tức khi Booking => Ai là người lập?
+    -- Thêm danh sách các dịch vụ mà ngươi khách này muốn đặt
+    -- Mỗi lần thêm sẽ cập nhập Grand_total
+-- Nếu lập Order khi thanh toán
+    -- Lúc này grand_order ở đâu để ràng buộc
+CREATE OR REPLACE TRIGGER trg_sync_order_totals -- tính tổng tiền bất đồng bộ
+AFTER INSERT OR UPDATE OR DELETE ON order_details
+FOR EACH ROW
+BEGIN
+    -- 1. XỬ LÝ KHI THÊM CHI TIẾT HÓA ĐƠN MỚI
+    IF INSERTING THEN
+        UPDATE orders
+        SET subtotal = subtotal + :NEW.line_total,
+            -- grand_total luôn bằng subtotal + tax_total (tax_total giữ nguyên)
+            grand_total = (subtotal + :NEW.line_total)
+        WHERE order_id = :NEW.order_id;
+
+    -- 2. XỬ LÝ KHI XÓA CHI TIẾT HÓA ĐƠN
+    ELSIF DELETING THEN
+        UPDATE orders
+        SET subtotal = subtotal - :OLD.line_total,
+            grand_total = (subtotal - :OLD.line_total)
+        WHERE order_id = :OLD.order_id;
+
+    -- 3. XỬ LÝ KHI CẬP NHẬT (THAY ĐỔI SỐ LƯỢNG / ĐƠN GIÁ / LUÂN CHUYỂN ORDER)
+    ELSIF UPDATING THEN
+        -- Trường hợp 3a: Đổi order_details sang một hóa đơn khác (order_id bị đổi)
+        IF :OLD.order_id <> :NEW.order_id THEN
+            -- Trừ tiền ở hóa đơn cũ
+            UPDATE orders
+            SET subtotal = subtotal - :OLD.line_total,
+                grand_total = (subtotal - :OLD.line_total)
+            WHERE order_id = :OLD.order_id;
+            
+            -- Cộng tiền vào hóa đơn mới
+            UPDATE orders
+            SET subtotal = subtotal + :NEW.line_total,
+                grand_total = (subtotal + :NEW.line_total)
+            WHERE order_id = :NEW.order_id;
+            
+        -- Trường hợp 3b: Cập nhật lại số lượng/thành tiền trên cùng một hóa đơn
+        ELSE
+            UPDATE orders
+            SET subtotal = subtotal + (:NEW.line_total - :OLD.line_total),
+                grand_total = (subtotal + (:NEW.line_total - :OLD.line_total))
+            WHERE order_id = :NEW.order_id;
+        END IF;
+    END IF;
+END;
